@@ -1,6 +1,15 @@
+# Terraform working files
 **/.terraform/*
 *.tfstate
 *.tfstate.*
-*.tfplan
 crash.log
-.terragrunt-cache/
+crash.*.log
+
+# Variable files that may contain secrets
+*.tfvars
+*.tfvars.json
+
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
