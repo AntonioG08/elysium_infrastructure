@@ -1,0 +1,16 @@
+# Normalize text files to LF in Git.
+* text=auto eol=lf
+
+# Explicitly enforce LF for shell scripts and configuration.
+*.sh text eol=lf
+.env.example text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.tf text eol=lf
+*.hcl text eol=lf
+*.py text eol=lf
+
+# Keep local developer configuration out of version control.
+.env -text
