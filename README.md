@@ -2,7 +2,7 @@
 
 Infrastructure as Code for **Elysium**, my personal cloud project on AWS. It's built with Terraform, and Terragrunt will join as the project grows. Security guardrails are part of the design from the very first commit.
 
-> **Status: early stage.** The repository currently contains the bootstrap for the Terraform remote state and the local tooling to open MFA-authenticated AWS CLI sessions. This README grows alongside the infrastructure.
+> **Status: early stage.** The repository currently contains the bootstrap for the Terraform remote state, the first Terragrunt-managed environment (`dev`), the account's MFA-enforcement policy and the local tooling to open MFA-authenticated AWS CLI sessions. This README grows alongside the infrastructure.
 
 ---
 
@@ -14,6 +14,7 @@ Infrastructure as Code for **Elysium**, my personal cloud project on AWS. It's b
   - [IAM identities](#iam-identities)
   - [Enforced MFA](#enforced-mfa)
   - [The console vs. CLI gotcha](#the-console-vs-cli-gotcha)
+  - [Threat model: the MFA re-enrollment bypass](#threat-model-the-mfa-re-enrollment-bypass)
 - [MFA session script](#mfa-session-script)
   - [What it does](#what-it-does)
   - [Setup](#setup)
@@ -35,6 +36,16 @@ elysium_infrastructure/
 │   ├── outputs.tf             #   Exposes the bucket name
 │   ├── provider.tf            #   Terraform/provider version pins, region and default tags
 │   └── .terraform.lock.hcl    #   Provider lock file (committed on purpose)
+├── dev/                       # Terragrunt live configuration for the dev environment
+│   ├── root.hcl               #   Remote state (S3 + native lockfile), provider and default tags
+│   └── buckets/
+│       └── elysium-app-assets/  # First bucket deployed with Terragrunt
+├── modules/                   # Reusable Terraform modules
+│   └── s3/
+├── shared/                    # Account-wide resources, shared by every environment
+│   └── iam/
+│       └── policies/
+│           └── enforce-mfa.json # MFA-enforcement policy (source of truth)
 ├── scripts/
 │   └── aws-mfa-session.sh     # Opens an MFA-authenticated AWS CLI session in the current shell
 ├── .env.example               # Template for the MFA script configuration
@@ -49,6 +60,7 @@ elysium_infrastructure/
 | Tool | Version | Used for |
 |---|---|---|
 | [Terraform](https://developer.hashicorp.com/terraform/install) | `>= 1.10, < 2.0` | Provisioning infrastructure |
+| [Terragrunt](https://terragrunt.gruntwork.io/docs/getting-started/install/) | Current release | Managing environments and remote state |
 | [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) | v2 | Authentication and the MFA script |
 | Bash | 4.0+ (Linux or WSL) | Running the MFA script (it uses `mapfile`) |
 | Python | 3.x | Parsing the STS response inside the MFA script |
@@ -71,12 +83,33 @@ The AWS account is organized around separate identities with clearly scoped resp
 
 ### Enforced MFA
 
-Every IAM user is attached to a **custom MFA-enforcement policy**:
+Every IAM group has the customer-managed policy **`EnforceMFAConfiguration`** attached. Its source of truth lives in [`shared/iam/policies/enforce-mfa.json`](shared/iam/policies/enforce-mfa.json).
 
-1. A brand-new user can do **nothing** except register an MFA device on their own account. The rest of the console is blocked.
-2. Once MFA is set up and the user signs in with it, the permissions assigned to that user apply as usual.
+**Onboarding flow:**
 
-Under the hood, the policy uses a `Deny` statement conditioned on the `aws:MultiFactorAuthPresent` key. Any request that wasn't authenticated with MFA is denied, except the self-service actions needed to set MFA up.
+1. An admin creates the user with a console password only (**no access keys**) and adds it to the right group.
+2. The new user signs in and finds everything blocked, except registering an MFA device on their own user.
+3. After signing back in with MFA, the group's permissions apply as usual. Only now can the user change their password or create their own access keys.
+
+**How the policy is built:**
+
+| Statement | Effect | Purpose |
+|---|---|---|
+| `AllowViewAccountInfo` | Allow | Lets the console's MFA wizard read the password policy and list virtual devices |
+| `AllowCreateVirtualMFADevice` | Allow | Lets users create a virtual MFA device |
+| `AllowManageOwnMFAAndCredentials` | Allow | Self-service on **your own user only** (`${aws:username}`): MFA devices, password, access keys |
+| `AllowTagOwnUserForAccessKeyDescriptions` | Allow | The console stores access-key descriptions as user tags. Only tag keys matching `AKIA*` are allowed, so users can't self-assign arbitrary tags. |
+| `DenyAllIfNoMFA` | Deny | Denies **everything except** the MFA-setup actions and `sts:GetSessionToken` while MFA is absent |
+| `DenyMFAEnrollmentWithAccessKeysOnly` | Deny | Blocks MFA enrollment from bare access keys (see [Threat model](#threat-model-the-mfa-re-enrollment-bypass)) |
+| `DenyTouchingOtherUsersMFAWithoutMFA` | Deny | The no-MFA exceptions only ever apply to the caller's own user |
+
+Three details make it work:
+
+- **`Deny` + `NotAction`** means "deny everything *except* the listed actions". One statement covers every AWS service.
+- **`BoolIfExists`** matches when `aws:MultiFactorAuthPresent` is `false` **or missing**. Requests signed with long-term access keys don't carry the key at all, so they're denied too.
+- **An explicit `Deny` always beats an `Allow`.** Even `AdministratorAccess` is blocked until the user authenticates with MFA.
+
+The Allow statements matter for groups with limited permissions, such as DevOps. A `Deny` never grants anything, so without them a new user in that group couldn't even enroll MFA.
 
 ### The console vs. CLI gotcha
 
@@ -110,6 +143,34 @@ sequenceDiagram
     STS-->>You: Identity confirmed, session ready
     You->>AWS: aws ... / terraform ... (MFA-authenticated)
 ```
+
+### Threat model: the MFA re-enrollment bypass
+
+The first version of the policy only had `DenyAllIfNoMFA`. It protected the **password** well, but not the **access keys**. Its exceptions didn't care *how* a request was signed, so anyone holding a leaked key could:
+
+1. `iam:CreateVirtualMFADevice`: create their own virtual MFA device (an exception, so allowed without MFA).
+2. `iam:EnableMFADevice`: attach it to the victim's user. IAM allows up to 8 devices per user, so the legitimate one keeps working and nothing looks wrong.
+3. `sts:GetSessionToken` with *their* device: receive a fully MFA-authenticated session.
+
+**The fix** is `DenyMFAEnrollmentWithAccessKeysOnly`, which uses a `Null` condition:
+
+```json
+"Condition": { "Null": { "aws:MultiFactorAuthPresent": "true" } }
+```
+
+The key is **missing** only on requests signed with long-term access keys. A console session always carries it (as `false` before MFA), so new users can still enroll from the browser, while bare keys cannot.
+
+The next obvious trick, calling `sts:GetSessionToken` *without* an MFA code and using those credentials to enroll, doesn't work either. AWS rejects IAM API calls made with session-token credentials that were obtained without MFA.
+
+**Verification** (run against a real DevOps user before rolling the policy out):
+
+| # | Test | Result |
+|---|---|---|
+| 1 | Console sign-in before MFA, then register MFA | Everything blocked except MFA setup. Enrollment works. |
+| 2 | Create an access key with a description after MFA | Works |
+| 3 | `aws s3 ls` with bare access keys | `AccessDenied`, explicit deny |
+| 4 | `aws iam create-virtual-mfa-device …` with bare access keys | `AccessDenied`, **bypass closed** |
+| 5 | `source scripts/aws-mfa-session.sh`, then `aws s3 ls` | Works |
 
 ---
 
@@ -262,7 +323,9 @@ terraform apply
 - [x] Remote state bucket bootstrap
 - [x] MFA-authenticated CLI sessions
 - [ ] Enable versioning on the state bucket
-- [ ] State locking with the S3 native lockfile (`use_lockfile = true`)
-- [ ] Manage IAM users, groups and the MFA-enforcement policy as code
-- [ ] Terragrunt live structure (single root config + per-environment settings)
+- [x] MFA-enforcement policy hardened against the re-enrollment bypass
+- [x] State locking with the S3 native lockfile (`use_lockfile = true`)
+- [x] First Terragrunt-managed environment (`dev`) with remote state
+- [ ] Manage IAM users, groups and the MFA-enforcement policy as code (the policy JSON is already versioned)
+- [ ] `prod` environment and shared resources
 - [ ] CI checks on pull requests (`fmt`, `validate`, `plan`)

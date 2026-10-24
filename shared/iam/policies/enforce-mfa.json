@@ -1,0 +1,101 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowViewAccountInfo",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetAccountPasswordPolicy",
+        "iam:ListVirtualMFADevices"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowCreateVirtualMFADevice",
+      "Effect": "Allow",
+      "Action": "iam:CreateVirtualMFADevice",
+      "Resource": "arn:aws:iam::*:mfa/*"
+    },
+    {
+      "Sid": "AllowManageOwnMFAAndCredentials",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetUser",
+        "iam:EnableMFADevice",
+        "iam:ListMFADevices",
+        "iam:ResyncMFADevice",
+        "iam:DeactivateMFADevice",
+        "iam:ChangePassword",
+        "iam:CreateAccessKey",
+        "iam:ListAccessKeys",
+        "iam:UpdateAccessKey",
+        "iam:DeleteAccessKey",
+        "iam:ListUserTags"
+      ],
+      "Resource": "arn:aws:iam::*:user/${aws:username}"
+    },
+    {
+      "Sid": "AllowTagOwnUserForAccessKeyDescriptions",
+      "Effect": "Allow",
+      "Action": [
+        "iam:TagUser",
+        "iam:UntagUser"
+      ],
+      "Resource": "arn:aws:iam::*:user/${aws:username}",
+      "Condition": {
+        "ForAllValues:StringLike": {
+          "aws:TagKeys": ["AKIA*"]
+        }
+      }
+    },
+    {
+      "Sid": "DenyAllIfNoMFA",
+      "Effect": "Deny",
+      "NotAction": [
+        "iam:CreateVirtualMFADevice",
+        "iam:EnableMFADevice",
+        "iam:GetUser",
+        "iam:ListMFADevices",
+        "iam:ResyncMFADevice",
+        "sts:GetSessionToken"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "BoolIfExists": {
+          "aws:MultiFactorAuthPresent": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyMFAEnrollmentWithAccessKeysOnly",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateVirtualMFADevice",
+        "iam:EnableMFADevice",
+        "iam:ResyncMFADevice"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:MultiFactorAuthPresent": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyTouchingOtherUsersMFAWithoutMFA",
+      "Effect": "Deny",
+      "Action": [
+        "iam:EnableMFADevice",
+        "iam:ResyncMFADevice",
+        "iam:ListMFADevices",
+        "iam:GetUser"
+      ],
+      "NotResource": "arn:aws:iam::*:user/${aws:username}",
+      "Condition": {
+        "BoolIfExists": {
+          "aws:MultiFactorAuthPresent": "false"
+        }
+      }
+    }
+  ]
+}
